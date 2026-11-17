@@ -16,7 +16,7 @@ USB Bluetooth controller. Download the wheel from [Releases](https://github.com/
 ```sh
 python -m venv .venv
 . .venv/bin/activate
-pip install ./bumble_ha_proxy-0.1.0-py3-none-any.whl
+pip install ./bumble_ha_proxy-0.1.1-py3-none-any.whl
 bumble-ha-proxy --transport usb:VID:PID
 ```
 
@@ -40,7 +40,7 @@ Images are published for Linux amd64 and arm64:
 docker run --rm --name bumble-ha-proxy \
   --device /dev/bus/usb/001/002 \
   -p 127.0.0.1:6053:6053 \
-  ghcr.io/ammarlakis/bumble-ha-proxy:0.1.0 \
+  ghcr.io/ammarlakis/bumble-ha-proxy:0.1.1 \
   --transport usb:VID:PID --listen 0.0.0.0
 ```
 

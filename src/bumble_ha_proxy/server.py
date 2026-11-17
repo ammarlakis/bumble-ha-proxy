@@ -3,13 +3,13 @@
 import argparse
 import asyncio
 import logging
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 
 from aioesphomeapi import api_pb2 as pb
 from aioesphomeapi.core import MESSAGE_TYPE_TO_PROTO
 from bumble.core import BaseBumbleError
-from bumble.device import Device, Peer
-from bumble.hci import Address
+from bumble.device import ConnectionParametersPreferences, Device, Peer
+from bumble.hci import HCI_LE_1M_PHY, Address
 from bumble.transport import open_transport
 
 LOG = logging.getLogger(__name__)
@@ -45,6 +45,17 @@ def uuid_parts(uuid):
     return [value >> 64, value & ((1 << 64) - 1)]
 
 
+@contextmanager
+def handle_link_loss():
+    # Bumble cancels the pending ATT future when that peripheral disconnects.
+    # Let its disconnect callback report the loss without ending the HA session.
+    try:
+        yield
+    except asyncio.CancelledError:
+        if asyncio.current_task().cancelling():
+            raise
+
+
 class Proxy:
     def __init__(self, radio, name="bumble-proxy", slots=3):
         self.radio = radio
@@ -52,6 +63,10 @@ class Proxy:
         self.slots = slots
         self.client = None
         self.radio_lock = asyncio.Lock()
+
+    async def start_scanning(self):
+        # Leave airtime for connected peripherals sharing the USB controller.
+        await self.radio.start_scanning(scan_interval=320, scan_window=30)
 
     async def accept(self, reader, writer):
         # One HA API owner avoids conflicting writes and connection ownership.
@@ -163,7 +178,7 @@ class Session:
                     api_version_major=1,
                     api_version_minor=9,
                     name=self.proxy.name,
-                    server_info="Bumble HA Proxy 0.1.0",
+                    server_info="Bumble HA Proxy 0.1.1",
                 )
             )
         elif isinstance(msg, pb.AuthenticationRequest):
@@ -186,7 +201,7 @@ class Session:
                     manufacturer="Bumble HA Proxy",
                     esphome_version="2025.12.0",
                     project_name="bumble.ha-proxy",
-                    project_version="0.1.0",
+                    project_version="0.1.1",
                     bluetooth_proxy_feature_flags=1 | 2 | 4 | 32,
                 )
             )
@@ -198,21 +213,29 @@ class Session:
         elif isinstance(msg, pb.SubscribeBluetoothLEAdvertisementsRequest):
             self.advertisements = True
             if not self.proxy.radio.is_scanning:
-                await self.proxy.radio.start_scanning()
+                await self.proxy.start_scanning()
         elif isinstance(msg, pb.UnsubscribeBluetoothLEAdvertisementsRequest):
             self.advertisements = False
             if self.proxy.radio.is_scanning:
                 await self.proxy.radio.stop_scanning()
         elif isinstance(msg, pb.BluetoothDeviceRequest):
-            await self.device_request(msg)
+            with handle_link_loss():
+                await self.device_request(msg)
         elif type(msg).__name__.startswith("BluetoothGATT"):
-            await self.gatt_request(msg)
+            with handle_link_loss():
+                await self.gatt_request(msg)
 
     def disconnected(self, address, reason):
+        if reason != 0x16:  # Locally requested disconnects are routine after polls.
+            LOG.info("BLE disconnect %012X, HCI reason %#04x", address, reason)
         self.peers.pop(address, None)
         if not self.closing:
             self.send(
-                pb.BluetoothDeviceConnectionResponse(address=address, connected=False)
+                pb.BluetoothDeviceConnectionResponse(
+                    address=address,
+                    connected=False,
+                    error=0 if reason == 0x16 else reason,
+                )
             )
             self.slots()
 
@@ -256,7 +279,15 @@ class Session:
                 target = Address(text, msg.address_type)
                 for attempt in range(2):
                     try:
-                        connection = await self.proxy.radio.connect(target, timeout=8)
+                        connection = await self.proxy.radio.connect(
+                            target,
+                            connection_parameters_preferences={
+                                HCI_LE_1M_PHY: ConnectionParametersPreferences(
+                                    supervision_timeout=4000
+                                )
+                            },
+                            timeout=8,
+                        )
                         break
                     except (BaseBumbleError, TimeoutError):
                         if attempt:
@@ -281,7 +312,7 @@ class Session:
             self.send(pb.BluetoothDeviceConnectionResponse(address=address, error=133))
         finally:
             if self.advertisements and not self.proxy.radio.is_scanning:
-                await self.proxy.radio.start_scanning()
+                await self.proxy.start_scanning()
 
     async def gatt_request(self, msg):
         peer = self.peers.get(msg.address)

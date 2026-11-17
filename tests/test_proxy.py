@@ -3,9 +3,11 @@ from contextlib import suppress
 
 import pytest
 from aioesphomeapi import APIClient
+from aioesphomeapi.core import BluetoothConnectionDroppedError
 from bumble.controller import Controller
 from bumble.device import Device
 from bumble.gatt import Characteristic, Service
+from bumble.gatt_server import Server
 from bumble.hci import Address
 from bumble.link import LocalLink
 
@@ -13,7 +15,7 @@ from bumble_ha_proxy.server import Proxy, address_number
 
 
 @pytest.mark.asyncio
-async def test_real_client_over_simulated_radio():
+async def test_real_client_over_simulated_radio(monkeypatch):
     link = LocalLink()
     controllers = [
         Controller(str(i), link=link, public_address=f"F0:F1:F2:F3:F4:0{i}")
@@ -86,7 +88,23 @@ async def test_real_client_over_simulated_radio():
         assert received == [b"notification"]
         await stop()
         # The peripheral drops the link independently of Home Assistant.
-        await next(iter(radios[1].connections.values())).disconnect()
+        # Drop the link while a real ATT read is waiting on its response.
+        waiting = asyncio.Event()
+
+        def drop_response(*args, **kwargs):
+            waiting.set()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Server, "on_att_read_request", drop_response)
+            reading = asyncio.create_task(
+                client.bluetooth_gatt_read(address, handle, timeout=4)
+            )
+            await asyncio.wait_for(waiting.wait(), 2)
+            await next(iter(radios[1].connections.values())).disconnect()
+            with pytest.raises(BluetoothConnectionDroppedError):
+                await reading
+        assert (await client.device_info()).name == "bumble-proxy"
+        assert (await client.bluetooth_gatt_get_services(second_address)).services
         await asyncio.wait_for(disconnected.wait(), 3)
         await radios[1].start_advertising()
         await client.bluetooth_device_connect(
